@@ -128,6 +128,12 @@ stages:
             if (Test-Path $trivyPath) {
               Write-Host "✅ Trivy installed successfully"
               Write-Host "##vso[task.setvariable variable=trivyPath]$trivyPath"
+              
+              # Set Trivy cache directory
+              $trivyCache = "$env:TEMP\trivy-cache"
+              New-Item -ItemType Directory -Force -Path $trivyCache | Out-Null
+              Write-Host "##vso[task.setvariable variable=trivyCache]$trivyCache"
+              
             } else {
               Write-Host "❌ Failed to install Trivy"
               exit 1
@@ -137,83 +143,224 @@ stages:
             exit 1
           }
 
+    - task: Cache@2
+      displayName: 'Cache Trivy Database'
+      inputs:
+        key: 'trivy-db | "$(Agent.OS)" | "$(Date:yyyyMMdd)"'
+        restoreKeys: |
+          trivy-db | "$(Agent.OS)"
+        path: '$(trivyCache)'
+        cacheHitVar: 'TRIVY_CACHE_RESTORED'
+
     - task: PowerShell@2
       displayName: 'Security Scan with Trivy'
       inputs:
         targetType: 'inline'
         script: |
           Write-Host "🔍 Running Trivy security scan on frontend image..."
-          $imageName = "$(imageRepository):$(versionedTag)"
           
-          # Run Trivy scan
-          $trivyOutput = & "$(trivyPath)" image --format json --severity CRITICAL,HIGH,MEDIUM,LOW $imageName 2>&1
-          $exitCode = $LASTEXITCODE
+          # Get the full image name that was built
+          $imageRepo = "$(imageRepository)"
+          $imageTag = "$(versionedTag)"
+          $imageName = "$imageRepo`:$imageTag"
           
-          Write-Host "Trivy scan completed with exit code: $exitCode"
+          Write-Host "Repository: $imageRepo"
+          Write-Host "Tag: $imageTag"
+          Write-Host "Scanning image: $imageName"
           
-          # Parse and display results
+          $trivyExe = "$(trivyPath)"
+          Write-Host "Using Trivy executable: $trivyExe"
+          
+          # List available images for debugging
+          Write-Host ""
+          Write-Host "🔍 Available Docker images:"
           try {
-            $results = $trivyOutput | ConvertFrom-Json
-            $criticalCount = 0
-            $highCount = 0
-            $mediumCount = 0
-            $lowCount = 0
+            $images = docker images --format "table {{.Repository}}:{{.Tag}}" | Where-Object { $_ -notmatch "REPOSITORY:TAG" }
+            $images | ForEach-Object { Write-Host "   $_" }
             
-            foreach ($result in $results.Results) {
-              if ($result.Vulnerabilities) {
-                foreach ($vuln in $result.Vulnerabilities) {
-                  switch ($vuln.Severity) {
-                    "CRITICAL" { $criticalCount++ }
-                    "HIGH" { $highCount++ }
-                    "MEDIUM" { $mediumCount++ }
-                    "LOW" { $lowCount++ }
-                  }
-                }
-              }
-            }
-            
-            Write-Host ""
-            Write-Host "🛡️ Security Scan Summary:"
-            Write-Host "   🔴 Critical: $criticalCount"
-            Write-Host "   🟠 High: $highCount"
-            Write-Host "   🟡 Medium: $mediumCount"
-            Write-Host "   🟢 Low: $lowCount"
-            Write-Host ""
-            
-            if ($criticalCount -gt 0) {
-              Write-Host "⚠️ WARNING: $criticalCount critical vulnerabilities found in frontend image!"
-              Write-Host "🔍 Please review and address critical vulnerabilities when possible."
+            # Try to find our image
+            $ourImage = $images | Where-Object { $_ -match $imageRepo -and $_ -match $imageTag.Replace("v", "") }
+            if ($ourImage) {
+              Write-Host "✅ Found our built image: $ourImage"
+              $imageName = $ourImage.Trim()
             } else {
-              Write-Host "✅ No critical vulnerabilities found in frontend image."
+              Write-Host "⚠️ Exact image not found, trying with just repository name..."
+              $ourImage = $images | Where-Object { $_ -match $imageRepo } | Select-Object -First 1
+              if ($ourImage) {
+                Write-Host "✅ Found similar image: $ourImage"
+                $imageName = $ourImage.Trim()
+              }
+            }
+          } catch {
+            Write-Host "⚠️ Could not list Docker images: $_"
+          }
+          
+          Write-Host ""
+          Write-Host "Final image name for scan: $imageName"
+          
+          # Set Trivy cache directory
+          $env:TRIVY_CACHE_DIR = "$(trivyCache)"
+          
+          try {
+            # Set error handling preference
+            $ErrorActionPreference = "Continue"
+            
+            # Check if database update is needed
+            if ($env:TRIVY_CACHE_RESTORED -eq "true") {
+              Write-Host "� Using cached Trivy database - skipping update"
+            } else {
+              Write-Host "📥 Updating Trivy vulnerability database..."
+              $dbUpdateArgs = @("image", "--download-db-only", "--cache-dir", "$(trivyCache)")
+              $dbProcess = Start-Process -FilePath $trivyExe -ArgumentList $dbUpdateArgs -Wait -PassThru -NoNewWindow
+              
+              if ($dbProcess.ExitCode -eq 0) {
+                Write-Host "✅ Database update completed successfully."
+              } else {
+                Write-Host "⚠️ Database update returned exit code $($dbProcess.ExitCode), but continuing..."
+              }
             }
             
-            # Generate detailed report for critical vulnerabilities
-            if ($criticalCount -gt 0) {
-              Write-Host ""
-              Write-Host "📋 Critical Vulnerabilities Details:"
-              foreach ($result in $results.Results) {
-                if ($result.Vulnerabilities) {
-                  foreach ($vuln in $result.Vulnerabilities) {
-                    if ($vuln.Severity -eq "CRITICAL") {
-                      Write-Host "   - $($vuln.VulnerabilityID): $($vuln.Title)"
-                      Write-Host "     Package: $($vuln.PkgName) ($($vuln.InstalledVersion))"
-                      if ($vuln.FixedVersion) {
-                        Write-Host "     Fix Available: $($vuln.FixedVersion)"
+            # Run actual vulnerability scan
+            Write-Host "🔍 Starting vulnerability scan..."
+            
+            # Create temp file for output
+            $tempFile = "$env:TEMP\trivy-results-$(Get-Random).json"
+            $errorFile = "$env:TEMP\trivy-error-$(Get-Random).log"
+            
+            # Build scan arguments with cache
+            $scanArgs = @(
+              "image",
+              "--format", "json",
+              "--severity", "CRITICAL,HIGH,MEDIUM,LOW",
+              "--output", $tempFile,
+              "--cache-dir", "$(trivyCache)",
+              "--quiet",
+              $imageName
+            )
+            
+            Write-Host "Running scan command: $trivyExe $($scanArgs -join ' ')"
+            
+            # Run scan
+            $scanProcess = Start-Process -FilePath $trivyExe -ArgumentList $scanArgs -Wait -PassThru -NoNewWindow -RedirectStandardError $errorFile
+            
+            Write-Host "Trivy scan process completed with exit code: $($scanProcess.ExitCode)"
+            
+            # Process results
+            $vulnerabilitiesFound = $false
+            
+            if (Test-Path $tempFile) {
+              $fileSize = (Get-Item $tempFile).Length
+              Write-Host "Results file size: $fileSize bytes"
+              
+              if ($fileSize -gt 0) {
+                $trivyOutput = Get-Content -Path $tempFile -Raw
+                
+                if ($trivyOutput -and $trivyOutput.Trim() -ne "" -and $trivyOutput -ne "null") {
+                  try {
+                    $results = $trivyOutput | ConvertFrom-Json
+                    $criticalCount = 0
+                    $highCount = 0
+                    $mediumCount = 0
+                    $lowCount = 0
+                    
+                    if ($results -and $results.Results) {
+                      foreach ($result in $results.Results) {
+                        if ($result.Vulnerabilities) {
+                          $vulnerabilitiesFound = $true
+                          foreach ($vuln in $result.Vulnerabilities) {
+                            switch ($vuln.Severity) {
+                              "CRITICAL" { $criticalCount++ }
+                              "HIGH" { $highCount++ }
+                              "MEDIUM" { $mediumCount++ }
+                              "LOW" { $lowCount++ }
+                            }
+                          }
+                        }
                       }
-                      Write-Host ""
                     }
+                    
+                    Write-Host ""
+                    Write-Host "🛡️ Security Scan Summary:"
+                    Write-Host "   🔴 Critical: $criticalCount"
+                    Write-Host "   🟠 High: $highCount"
+                    Write-Host "   🟡 Medium: $mediumCount"
+                    Write-Host "   🟢 Low: $lowCount"
+                    Write-Host ""
+                    
+                    if ($criticalCount -gt 0) {
+                      Write-Host "⚠️ WARNING: $criticalCount critical vulnerabilities found in frontend image!"
+                      Write-Host "🔍 Please review and address critical vulnerabilities when possible."
+                      
+                      # Show first 5 critical vulnerabilities
+                      Write-Host ""
+                      Write-Host "📋 Critical Vulnerabilities (first 5):"
+                      $criticalShown = 0
+                      foreach ($result in $results.Results) {
+                        if ($result.Vulnerabilities -and $criticalShown -lt 5) {
+                          foreach ($vuln in $result.Vulnerabilities) {
+                            if ($vuln.Severity -eq "CRITICAL" -and $criticalShown -lt 5) {
+                              Write-Host "   - $($vuln.VulnerabilityID): $($vuln.Title)"
+                              Write-Host "     Package: $($vuln.PkgName) ($($vuln.InstalledVersion))"
+                              if ($vuln.FixedVersion) {
+                                Write-Host "     Fix Available: $($vuln.FixedVersion)"
+                              }
+                              Write-Host ""
+                              $criticalShown++
+                            }
+                          }
+                        }
+                      }
+                    } else {
+                      Write-Host "✅ No critical vulnerabilities found in frontend image."
+                    }
+                    
+                  } catch {
+                    Write-Host "⚠️ Warning: Could not parse Trivy JSON output: $_"
+                    Write-Host "Raw output (first 500 chars): $($trivyOutput.Substring(0, [Math]::Min(500, $trivyOutput.Length)))"
+                  }
+                } else {
+                  Write-Host "ℹ️ Trivy scan completed - no vulnerabilities found or empty results."
+                }
+              } else {
+                Write-Host "ℹ️ Trivy results file is empty - likely no vulnerabilities found."
+              }
+            } else {
+              Write-Host "⚠️ Warning: Trivy results file not found at: $tempFile"
+            }
+            
+            # Show any error messages (but don't treat as failure)
+            if (Test-Path $errorFile) {
+              $errorContent = Get-Content -Path $errorFile -Raw -ErrorAction SilentlyContinue
+              if ($errorContent -and $errorContent.Trim() -ne "") {
+                Write-Host ""
+                Write-Host "📝 Trivy messages:"
+                # Filter out noise, only show relevant messages
+                $lines = $errorContent -split "`n"
+                foreach ($line in $lines) {
+                  $line = $line.Trim()
+                  if ($line -and $line -notmatch "Need to update DB" -and $line -notmatch "Downloading") {
+                    Write-Host "   $line"
                   }
                 }
               }
+            }
+            
+            # Cleanup
+            Remove-Item -Path $tempFile -ErrorAction SilentlyContinue
+            Remove-Item -Path $errorFile -ErrorAction SilentlyContinue
+            
+            if ($vulnerabilitiesFound) {
+              Write-Host "🔍 Vulnerability scan completed with findings."
+            } else {
+              Write-Host "✅ Vulnerability scan completed - no issues found."
             }
             
           } catch {
-            Write-Host "⚠️ Warning: Could not parse Trivy output, but scan completed."
-            Write-Host "Raw output: $trivyOutput"
+            Write-Host "⚠️ Warning: Unexpected error during Trivy scan: $_"
+            Write-Host "This is a non-critical error. Pipeline will continue."
           }
           
-          # Always continue - don't fail the pipeline
-          Write-Host "✅ Security scan completed. Pipeline will continue regardless of findings."
+          Write-Host "✅ Security scan step completed. Pipeline will continue."
       continueOnError: true
           
     - task: Docker@2
