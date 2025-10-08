@@ -107,6 +107,114 @@ stages:
         tags: |
           $(versionedTag)
           $(latestTag)
+
+    - task: PowerShell@2
+      displayName: 'Install Trivy'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Installing Trivy..."
+          # Download and install Trivy
+          $trivyVersion = "0.46.0"
+          $downloadUrl = "https://github.com/aquasecurity/trivy/releases/download/v$trivyVersion/trivy_$($trivyVersion)_Windows-64bit.zip"
+          $tempPath = "$env:TEMP\trivy.zip"
+          $extractPath = "$env:TEMP\trivy"
+          
+          try {
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $tempPath
+            Expand-Archive -Path $tempPath -DestinationPath $extractPath -Force
+            $trivyPath = "$extractPath\trivy.exe"
+            
+            if (Test-Path $trivyPath) {
+              Write-Host "✅ Trivy installed successfully"
+              Write-Host "##vso[task.setvariable variable=trivyPath]$trivyPath"
+            } else {
+              Write-Host "❌ Failed to install Trivy"
+              exit 1
+            }
+          } catch {
+            Write-Host "❌ Error installing Trivy: $_"
+            exit 1
+          }
+
+    - task: PowerShell@2
+      displayName: 'Security Scan with Trivy'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "🔍 Running Trivy security scan on frontend image..."
+          $imageName = "$(imageRepository):$(versionedTag)"
+          
+          # Run Trivy scan
+          $trivyOutput = & "$(trivyPath)" image --format json --severity CRITICAL,HIGH,MEDIUM,LOW $imageName 2>&1
+          $exitCode = $LASTEXITCODE
+          
+          Write-Host "Trivy scan completed with exit code: $exitCode"
+          
+          # Parse and display results
+          try {
+            $results = $trivyOutput | ConvertFrom-Json
+            $criticalCount = 0
+            $highCount = 0
+            $mediumCount = 0
+            $lowCount = 0
+            
+            foreach ($result in $results.Results) {
+              if ($result.Vulnerabilities) {
+                foreach ($vuln in $result.Vulnerabilities) {
+                  switch ($vuln.Severity) {
+                    "CRITICAL" { $criticalCount++ }
+                    "HIGH" { $highCount++ }
+                    "MEDIUM" { $mediumCount++ }
+                    "LOW" { $lowCount++ }
+                  }
+                }
+              }
+            }
+            
+            Write-Host ""
+            Write-Host "🛡️ Security Scan Summary:"
+            Write-Host "   🔴 Critical: $criticalCount"
+            Write-Host "   🟠 High: $highCount"
+            Write-Host "   🟡 Medium: $mediumCount"
+            Write-Host "   🟢 Low: $lowCount"
+            Write-Host ""
+            
+            if ($criticalCount -gt 0) {
+              Write-Host "⚠️ WARNING: $criticalCount critical vulnerabilities found in frontend image!"
+              Write-Host "🔍 Please review and address critical vulnerabilities when possible."
+            } else {
+              Write-Host "✅ No critical vulnerabilities found in frontend image."
+            }
+            
+            # Generate detailed report for critical vulnerabilities
+            if ($criticalCount -gt 0) {
+              Write-Host ""
+              Write-Host "📋 Critical Vulnerabilities Details:"
+              foreach ($result in $results.Results) {
+                if ($result.Vulnerabilities) {
+                  foreach ($vuln in $result.Vulnerabilities) {
+                    if ($vuln.Severity -eq "CRITICAL") {
+                      Write-Host "   - $($vuln.VulnerabilityID): $($vuln.Title)"
+                      Write-Host "     Package: $($vuln.PkgName) ($($vuln.InstalledVersion))"
+                      if ($vuln.FixedVersion) {
+                        Write-Host "     Fix Available: $($vuln.FixedVersion)"
+                      }
+                      Write-Host ""
+                    }
+                  }
+                }
+              }
+            }
+            
+          } catch {
+            Write-Host "⚠️ Warning: Could not parse Trivy output, but scan completed."
+            Write-Host "Raw output: $trivyOutput"
+          }
+          
+          # Always continue - don't fail the pipeline
+          Write-Host "✅ Security scan completed. Pipeline will continue regardless of findings."
+      continueOnError: true
           
     - task: Docker@2
       displayName: 'Push image to ACR'
