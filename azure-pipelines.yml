@@ -74,30 +74,42 @@ stages:
       inputs:
         versionSpec: '18.x'
         
-    - script: |
-        echo "Installing dependencies..."
-        npm ci
+    - task: PowerShell@2
       displayName: 'Install dependencies'
-      workingDirectory: '$(Build.SourcesDirectory)'
-      
-    - script: |
-        echo "Running tests..."
-        npm run test -- --watchAll=false
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Installing dependencies..."
+          npm ci
+        workingDirectory: '$(Build.SourcesDirectory)'
+        
+    - task: PowerShell@2
       displayName: 'Run tests'
-      workingDirectory: '$(Build.SourcesDirectory)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Running tests..."
+          npm run test -- --watchAll=false
+        workingDirectory: '$(Build.SourcesDirectory)'
       continueOnError: true
       
-    - script: |
-        echo "Building React application..."
-        npm run build
+    - task: PowerShell@2
       displayName: 'Build React app'
-      workingDirectory: '$(Build.SourcesDirectory)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Building React application..."
+          npm run build
+        workingDirectory: '$(Build.SourcesDirectory)'
       
-    - script: |
-        echo "Running security audit..."
-        npm audit --audit-level high
+    - task: PowerShell@2
       displayName: 'Security audit'
-      workingDirectory: '$(Build.SourcesDirectory)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Running security audit..."
+          npm audit --audit-level high
+        workingDirectory: '$(Build.SourcesDirectory)'
       continueOnError: true
       
     - task: Docker@2
@@ -122,14 +134,17 @@ stages:
           $(versionedTag)
           $(latestTag)
           
-    - script: |
-        echo "✅ Frontend build completed successfully!"
-        echo "📦 Images created:"
-        echo "   - $(imageRepository):$(versionedTag)"
-        if [ -n "$(latestTag)" ]; then
-          echo "   - $(imageRepository):$(latestTag)"
-        fi
-        echo "🔗 Registry: ACR"
-        echo "🌿 Branch: $(branchName)"
-        echo "🏷️ Version: $(majorVersion).$(minorVersion).$(patchVersion)"
+    - task: PowerShell@2
       displayName: 'Build Summary'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "✅ Frontend build completed successfully!"
+          Write-Host "📦 Images created:"
+          Write-Host "   - $(imageRepository):$(versionedTag)"
+          if ("$(latestTag)" -ne "") {
+            Write-Host "   - $(imageRepository):$(latestTag)"
+          }
+          Write-Host "🔗 Registry: ACR"
+          Write-Host "🌿 Branch: $(branchName)"
+          Write-Host "🏷️ Version: $(majorVersion).$(minorVersion).$(patchVersion)"
