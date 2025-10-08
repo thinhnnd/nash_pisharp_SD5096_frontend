@@ -1,39 +1,136 @@
-# Docker
-# Build and push an image to Azure Container Registry
-# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+# Azure DevOps Pipeline for Frontend Application
+# Build and push Docker image to ACR
+
+name: Frontend-Build-$(Date:yyyyMMdd)-$(Rev:r)
 
 trigger:
-- main
-
-resources:
-- repo: self
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    exclude:
+    - README.md
+    - docs/*
+    - '*.md'
 
 variables:
-  # Container registry service connection established during pipeline creation
-  dockerRegistryServiceConnection: 'cc52f7b5-fdc4-411a-b569-11da3824ed48'
+  # Version configuration
+  majorVersion: 1
+  minorVersion: 0
+  patchVersion: '$(Build.BuildId)'
+  branchName: '$(Build.SourceBranchName)'
+  
+  # Azure Container Registry
+  containerRegistry: 'acrServiceConnection'  # Update this to match your ACR service connection name
   imageRepository: 'frontend'
-  containerRegistry: 'acrnashpisharp.azurecr.io'
-  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
-  tag: '$(Build.BuildId)'
-
-  # Agent VM image name
+  dockerfilePath: 'Dockerfile'
+  
+  # Build configuration
   vmImageName: 'ubuntu-latest'
 
 stages:
 - stage: Build
-  displayName: Build and push stage
+  displayName: 'Build and Push Frontend'
   jobs:
-  - job: Build
-    displayName: Build
+  - job: BuildFrontend
+    displayName: 'Build Frontend Application'
     pool:
       vmImage: $(vmImageName)
     steps:
-    - task: Docker@2
-      displayName: Build and push an image to container registry
+    - checkout: self
+      displayName: 'Checkout frontend source'
+    
+    - task: PowerShell@2
+      displayName: 'Set Version Tags'
       inputs:
-        command: buildAndPush
-        repository: $(imageRepository)
-        dockerfile: $(dockerfilePath)
-        containerRegistry: $(dockerRegistryServiceConnection)
+        targetType: 'inline'
+        script: |
+          $branchName = "$(Build.SourceBranchName)"
+          $versionedTag = "v$(majorVersion).$(minorVersion).$(patchVersion)"
+          $latestTag = ""
+          
+          Write-Host "Branch: $branchName"
+          Write-Host "Versioned tag: $versionedTag"
+          
+          # Set tags based on branch
+          if ($branchName -eq "main") {
+            $latestTag = "latest"
+            Write-Host "##vso[task.setvariable variable=versionedTag]$versionedTag"
+            Write-Host "##vso[task.setvariable variable=latestTag]$latestTag"
+            Write-Host "Tags will be: $versionedTag, $latestTag"
+          } elseif ($branchName -eq "develop") {
+            $devTag = "dev-v$(majorVersion).$(minorVersion).$(patchVersion)"
+            Write-Host "##vso[task.setvariable variable=versionedTag]$versionedTag"
+            Write-Host "##vso[task.setvariable variable=latestTag]$devTag"
+            Write-Host "Tags will be: $versionedTag, $devTag"
+          } else {
+            Write-Host "##vso[task.setvariable variable=versionedTag]$versionedTag"
+            Write-Host "##vso[task.setvariable variable=latestTag]"
+            Write-Host "Tags will be: $versionedTag"
+          }
+          
+    - task: NodeTool@0
+      displayName: 'Setup Node.js'
+      inputs:
+        versionSpec: '18.x'
+        
+    - script: |
+        echo "Installing dependencies..."
+        npm ci
+      displayName: 'Install dependencies'
+      workingDirectory: '$(Build.SourcesDirectory)'
+      
+    - script: |
+        echo "Running tests..."
+        npm run test -- --watchAll=false
+      displayName: 'Run tests'
+      workingDirectory: '$(Build.SourcesDirectory)'
+      continueOnError: true
+      
+    - script: |
+        echo "Building React application..."
+        npm run build
+      displayName: 'Build React app'
+      workingDirectory: '$(Build.SourcesDirectory)'
+      
+    - script: |
+        echo "Running security audit..."
+        npm audit --audit-level high
+      displayName: 'Security audit'
+      workingDirectory: '$(Build.SourcesDirectory)'
+      continueOnError: true
+      
+    - task: Docker@2
+      displayName: 'Build Docker image'
+      inputs:
+        containerRegistry: '$(containerRegistry)'
+        repository: '$(imageRepository)'
+        command: 'build'
+        Dockerfile: '$(dockerfilePath)'
+        buildContext: '$(Build.SourcesDirectory)'
         tags: |
-          $(tag)
+          $(versionedTag)
+          $(latestTag)
+          
+    - task: Docker@2
+      displayName: 'Push image to ACR'
+      inputs:
+        containerRegistry: '$(containerRegistry)'
+        repository: '$(imageRepository)'
+        command: 'push'
+        tags: |
+          $(versionedTag)
+          $(latestTag)
+          
+    - script: |
+        echo "✅ Frontend build completed successfully!"
+        echo "📦 Images created:"
+        echo "   - $(imageRepository):$(versionedTag)"
+        if [ -n "$(latestTag)" ]; then
+          echo "   - $(imageRepository):$(latestTag)"
+        fi
+        echo "🔗 Registry: ACR"
+        echo "🌿 Branch: $(branchName)"
+        echo "🏷️ Version: $(majorVersion).$(minorVersion).$(patchVersion)"
+      displayName: 'Build Summary'
