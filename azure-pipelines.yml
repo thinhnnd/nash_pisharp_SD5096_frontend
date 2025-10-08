@@ -25,9 +25,6 @@ variables:
   containerRegistry: 'acrServiceConnection'  # Update this to match your ACR service connection name
   imageRepository: 'frontend'
   dockerfilePath: 'Dockerfile'
-  
-  # Build configuration
-  vmImageName: 'ubuntu-latest'
 
 stages:
 - stage: Build
@@ -36,7 +33,9 @@ stages:
   - job: BuildFrontend
     displayName: 'Build Frontend Application'
     pool:
-      vmImage: $(vmImageName)
+      name: 'Default'  # Use Default agent pool (or your custom pool name)
+      demands:
+      - agent.name -equals THINHPC  # Optional: specify exact agent
     steps:
     - checkout: self
       displayName: 'Checkout frontend source'
